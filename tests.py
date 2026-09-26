@@ -4209,6 +4209,25 @@ class ИнструментарийАгента(unittest.TestCase):
         self.assertEqual(сводка["меняющих"], 0)
         self.assertGreater(сводка["токенов"], 0)
 
+    def test_одновременное_подключение_не_дублирует_инструменты(self):
+        # Страница присылает два изменения настроек подряд (галочка «давать
+        # инструменты» и поле серверов), а Flask отвечает в разных потоках — и
+        # «открыть» начиналось дважды. Список инструментов собирался двумя
+        # половинами, а провайдер отвечал «Tool names must be unique» на весь
+        # запрос. Нашлось живым показом в браузере.
+        ящик = amcp.Toolbox(["agent-state"], self.файл)
+        try:
+            потоки = [_threading.Thread(target=ящик.открыть) for _ in range(4)]
+            for поток in потоки:
+                поток.start()
+            for поток in потоки:
+                поток.join()
+            имена = [и["function"]["name"] for и in ящик.для_модели()]
+            self.assertEqual(len(имена), len(set(имена)), имена)
+            self.assertEqual(set(имена), {f"agent-state__{и}" for и in ИНСТРУМЕНТЫ_СВОЕГО})
+        finally:
+            ящик.close()
+
     def test_вызов_по_полному_имени(self):
         with amcp.Toolbox(["agent-state"], self.файл) as ящик:
             итог = ящик.вызвать("agent-state__list_tasks", {})
@@ -4687,6 +4706,42 @@ class ВебИнструментов(unittest.TestCase):
         self.assertTrue(результат["ок"])
         self.assertIn("перенос-моделей", результат["текст"])
 
+    def test_стенд_без_ключа_закрыт(self):
+        # DEMO_KEY включает ворота: стенд, вынесенный наружу туннелем (чтобы его
+        # увидело браузерное расширение), иначе отдал бы ключи провайдера и
+        # доступ к чужой системе всему интернету. Без переменной поведение
+        # прежнее — это проверяют все остальные тесты веба.
+        import importlib
+        import web
+
+        прежний = os.environ.get("DEMO_KEY")
+        os.environ["DEMO_KEY"] = "проба-ключа"
+        закрытый = importlib.reload(web)
+        try:
+            self.assertEqual(закрытый.app.test_client().get("/").status_code, 401)
+            self.assertEqual(закрытый.app.test_client().get("/?key=чужой").status_code, 401)
+            self.assertEqual(закрытый.app.test_client().get("/api/state").status_code, 401)
+            свой = закрытый.app.test_client()
+            self.assertEqual(свой.get("/?key=проба-ключа").status_code, 200)
+            # Ключ спрашивается один раз: дальше едет кука.
+            self.assertEqual(свой.get("/api/state").status_code, 200)
+        finally:
+            закрытый.agent.close()
+            if прежний is None:
+                os.environ.pop("DEMO_KEY", None)
+            else:
+                os.environ["DEMO_KEY"] = прежний
+            type(self).web = importlib.reload(web)
+            type(self).клиент = self.web.app.test_client()
+
+    def test_аргументы_заявки_видны_целиком(self):
+        # Аргументы заявки бывают не только строками. String() печатал объект
+        # как «[object Object]», и человек, которого спрашивают, не видел, что
+        # именно уйдёт в чужую систему.
+        html = self.клиент.get("/").get_data(as_text=True)
+        self.assertIn("typeof зн === 'string' ? зн : JSON.stringify(зн)", html)
+        self.assertNotIn("экранировать(String(зн))", html)
+
     def test_выдуманный_инструмент_это_ошибка_запроса(self):
         ответ = self.клиент.post("/api/mcp/call",
                                  json={"tool": "agent-state__drop", "args": {}})
@@ -4722,6 +4777,106 @@ class ВебИнструментов(unittest.TestCase):
     def test_неизвестное_действие(self):
         ответ = self.клиент.post("/api/calls", json={"номер": 1, "действие": "стереть"})
         self.assertEqual(ответ.status_code, 400)
+
+class ПоказВБраузере(unittest.TestCase):
+    """Набор для показа дня: сценарий расширению, стенд, запись и режим «показ».
+
+    Проверяется не поведение модели, а состоятельность набора: что сцены водителя
+    опираются на элементы, которые на странице действительно есть, что скрипты
+    запускаются и ссылаются друг на друга теми же ключами, которыми описаны, и
+    что запись по умолчанию берёт окно браузера, а не весь экран. Ошибка здесь
+    обнаруживается иначе только живым прогоном.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        читать = lambda *части: pathlib.Path(
+            os.path.join(КОРЕНЬ_ДНЯ, *части)).read_text(encoding="utf-8")
+        cls.водитель = читать("browser.mjs")
+        cls.показ = cls.водитель.split("if (РЕЖИМ === 'показ')")[1].split(
+            "if (РЕЖИМ === 'инструменты')")[0]
+        cls.страница = читать("templates", "index.html")
+        cls.сценарий = читать("DEMO-CHROME.md")
+        cls.стенд = читать("demo_stand.sh")
+        cls.запись = читать("record_demo.sh")
+        cls.показать = читать("demo_show.sh")
+
+    def test_шесть_сцен_с_подписями(self):
+        for номер in range(1, 7):
+            self.assertIn(f"Сцена {номер}", self.показ)
+            self.assertIn(f"Сцена {номер}", self.сценарий)
+        self.assertIn("подпись-показа", self.показ)
+        self.assertIn("process.env.PAUSE", self.показ)      # темп задаётся снаружи
+        self.assertIn("process.exit(0)", self.показ)        # показ не проверка
+
+    def test_сцены_опираются_на_настоящие_элементы_страницы(self):
+        # Самая дорогая ошибка показа — опечатка в идентификаторе: водитель
+        # молча ничего не нажимает, а видно это только на прогоне.
+        for узел in ("mcp-панель", "заявки-панель", "инструменты-вкл",
+                     "инструменты-серверы", "инструменты-итог", "ввод",
+                     "отправить", "модель", "чат"):
+            self.assertIn(узел, self.показ, f"сцены не пользуются «{узел}»")
+            self.assertIn(f'id="{узел}"', self.страница, f"на странице нет «{узел}»")
+        for класс in ("mcp-подключить", "mcp-вызвать", "заявка-да"):
+            self.assertIn(класс, self.показ, f"сцены не пользуются «{класс}»")
+            self.assertIn(класс, self.страница, f"на странице нет «{класс}»")
+
+    def test_сцены_проверяют_пункты_задания(self):
+        # Каждая сцена что-то утверждает: без утверждений показ был бы просто
+        # записью экрана, по которой непонятно, сошлось ли с ожиданием.
+        for признак in ("add_comment",                  # свой инструмент вокруг API
+                        "схема ≈",                      # цена описаний на виду
+                        "↳ tracker__",                  # модель зовёт сама
+                        "меняющий вызов выполнился без подтверждения",
+                        "добавлен",                     # подтверждение исполняет
+                        "tracker__get_issue",           # человек зовёт руками
+                        "не похоже на ключ задачи"):    # аргумент проверяет сервер
+            self.assertIn(признак, self.показ, f"сцены не проверяют «{признак}»")
+        self.assertIn("РАСХОЖДЕНИЯ", self.показ)
+
+    def test_сценарий_расширению_описывает_тот_же_стенд(self):
+        for команда in ("bash demo_stand.sh", "bash record_demo.sh", "bash demo_show.sh"):
+            self.assertIn(команда, self.сценарий)
+        self.assertIn("5001", self.сценарий)                # порт 5000 — не наш
+        self.assertIn("MIG-7", self.сценарий)               # задача сцен 4–6
+        self.assertIn("../../etc/passwd", self.сценарий)    # выдуманный ключ
+        self.assertIn("Подтвердить и выполнить", self.сценарий)
+
+    def test_скрипты_запускаются_и_согласованы(self):
+        for имя in ("demo_stand.sh", "record_demo.sh", "demo_show.sh"):
+            путь = os.path.join(КОРЕНЬ_ДНЯ, имя)
+            self.assertTrue(os.access(путь, os.X_OK), f"{имя} не исполняемый")
+            готово = _subprocess.run(["bash", "-n", путь], capture_output=True, text=True)
+            self.assertEqual(готово.returncode, 0, готово.stderr)
+            справка = _subprocess.run(["bash", путь, "--help"],
+                                      capture_output=True, text=True, timeout=60)
+            self.assertEqual(справка.returncode, 0, справка.stderr)
+            self.assertIn("Запуск:", справка.stdout)
+            self.assertNotIn("set -u", справка.stdout, f"справка {имя} задевает код")
+        self.assertIn("PORT=5001", self.стенд)              # 5000 — сервер человека
+        self.assertIn("DEMO_KEY", self.стенд)
+        self.assertIn("tracker_api.py", self.стенд)         # без мока показывать нечего
+        self.assertIn("record_demo.sh\" --name показ --pid", self.показать)
+
+    def test_запись_берёт_окно_а_не_экран(self):
+        # В кадре должно быть только окно браузера: рабочий стол и окно редактора
+        # к работе агента не относятся.
+        self.assertIn("_NET_CLIENT_LIST", self.запись)      # ищем окно у X
+        # Вокруг окна Chrome лежит прозрачная тень: в геометрии X она есть, на
+        # экране её нет. Без поправки по краям кадра видна полоска рабочего стола.
+        self.assertIn("_GTK_FRAME_EXTENTS", self.запись)
+        self.assertIn("--pid", self.запись)
+        self.assertIn("--screen", self.запись)              # весь экран — только явно
+        self.assertIn("% 2", self.запись)                   # чётные размеры для yuv420p
+        self.assertIn('WINDOW="Google Chrome"', self.запись)
+        self.assertIn('kill -INT "$FF"', self.запись)       # иначе mp4 без moov-атома
+
+    def test_записи_не_попадают_в_репозиторий(self):
+        игнор = pathlib.Path(os.path.join(КОРЕНЬ_ДНЯ, ".gitignore")).read_text(
+            encoding="utf-8")
+        for правило in ("/demo/", "/demo-memory/"):
+            self.assertIn(правило, игнор)
+
 
 # --- живые проверки -----------------------------------------------------------
 
